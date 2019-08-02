@@ -1,0 +1,153 @@
+diff -urbN pdo_odbc.orig/odbc_driver.c pdo_odbc/odbc_driver.c
+--- pdo_odbc.orig/odbc_driver.c	2017-05-26 09:10:22.000000000 +0000
++++ pdo_odbc/odbc_driver.c	2017-05-26 09:12:29.933333335 +0000
+@@ -338,11 +338,27 @@
+ 
+ static int odbc_handle_set_attr(pdo_dbh_t *dbh, long attr, zval *val TSRMLS_DC)
+ {
++	RETCODE rc;
+ 	pdo_odbc_db_handle *H = (pdo_odbc_db_handle *)dbh->driver_data;
+ 	switch (attr) {
+ 		case PDO_ODBC_ATTR_ASSUME_UTF8:
+ 			H->assume_utf8 = zval_is_true(val);
+ 			return 1;
++		case PDO_ATTR_AUTOCOMMIT:
++			convert_to_boolean(val);
++			/* ignore if the new value equals the old one */
++			if (dbh->auto_commit ^ Z_BVAL_P(val)) {
++				rc = SQLSetConnectAttr(H->dbc, SQL_ATTR_AUTOCOMMIT,
++						(SQLPOINTER)(dbh->auto_commit ? SQL_AUTOCOMMIT_OFF : SQL_AUTOCOMMIT_ON),
++						SQL_IS_INTEGER);
++				if (rc != SQL_SUCCESS) {
++					pdo_odbc_drv_error("SQLSetConnectAttr AUTOCOMMIT");
++					return 0;
++				}
++				dbh->in_txn = !Z_BVAL_P(val);
++				dbh->auto_commit = Z_BVAL_P(val);
++			}
++			return 1;
+ 		default:
+ 			strcpy(H->einfo.last_err_msg, "Unknown Attribute");
+ 			H->einfo.what = "setAttribute";
+@@ -358,6 +374,9 @@
+ 		case PDO_ATTR_CLIENT_VERSION:
+ 			ZVAL_STRING(val, "ODBC-" PDO_ODBC_TYPE, 1);
+ 			return 1;
++		case PDO_ATTR_AUTOCOMMIT:
++			ZVAL_BOOL(val, dbh->auto_commit);
++			return 1;
+ 
+ 		case PDO_ATTR_SERVER_VERSION:
+ 		case PDO_ATTR_PREFETCH:
+diff -urbN pdo_odbc.orig/odbc_stmt.c pdo_odbc/odbc_stmt.c
+--- pdo_odbc.orig/odbc_stmt.c	2017-05-26 09:10:22.000000000 +0000
++++ pdo_odbc/odbc_stmt.c	2017-05-26 09:31:22.826885741 +0000
+@@ -635,6 +635,7 @@
+ 	pdo_odbc_stmt *S = (pdo_odbc_stmt*)stmt->driver_data;
+ 	pdo_odbc_column *C = &S->cols[colno];
+ 	unsigned long ulen;
++	SQLSMALLINT DataType;
+ 
+ 	/* if it is a column containing "long" data, perform late binding now */
+ 	if (C->is_long) {
+@@ -642,11 +643,27 @@
+ 		char *buf;
+ 		RETCODE rc;
+ 
++		/* hj fix binary */
++		if (C->is_unicode) {
++			DataType = SQL_C_BINARY;
++		} else {
++			switch(C->coltype) {
++				case SQL_BINARY:
++				case SQL_VARBINARY:
++				case SQL_LONGVARBINARY:
++				  DataType = SQL_C_BINARY;
++				  break;
++			  	default:
++				  DataType = SQL_C_CHAR;
++				  break;
++			}
++		}
++
+ 		/* fetch it into C->data, which is allocated with a length
+ 		 * of 256 bytes; if there is more to be had, we then allocate
+ 		 * bigger buffer for the caller to free */
+ 
+-		rc = SQLGetData(S->stmt, colno+1, C->is_unicode ? SQL_C_BINARY : SQL_C_CHAR, C->data,
++		rc = SQLGetData(S->stmt, colno+1, DataType, C->data,  /* hj add */
+  			256, &C->fetched_len);
+ 
+ 		if (rc == SQL_SUCCESS) {
+@@ -667,13 +684,19 @@
+ 			char *buf2;
+ 
+ 			buf2 = emalloc(256);
++			if (DataType == SQL_C_BINARY) {    /* hj add */
++				buf = emalloc(256);
++				memcpy(buf, C->data, 256);
++				used = 256;
++			} else { 
+ 			buf = estrndup(C->data, 256);
+ 			used = 255; /* not 256; the driver NUL terminated the buffer */
++			}
+ 			
+ 			do {
+ 				C->fetched_len = 0;
+ 				/* read block. 256 bytes => 255 bytes are actually read, the last 1 is NULL */
+-				rc = SQLGetData(S->stmt, colno+1, SQL_C_CHAR, buf2, 256, &C->fetched_len);
++				rc = SQLGetData(S->stmt, colno+1, DataType, buf2, 256, &C->fetched_len);  /* hj add */
+ 				
+ 				/* resize output buffer and reassemble block */
+ 				if (rc==SQL_SUCCESS_WITH_INFO) {
+@@ -681,8 +704,13 @@
+ 					 states that if SQL_SUCCESS_WITH_INFO, fetched_len will be > 255 (greater than buf2's size)
+ 					 (if a driver fails to follow that and wrote less than 255 bytes to buf2, this will AV or read garbage into buf) */
+ 					buf = erealloc(buf, used + 255+1);
++					if (DataType == SQL_C_BINARY) {    /* hj add */
++						memcpy(buf + used, buf2, 256);
++						used = used + 256;
++					} else { 
+ 					memcpy(buf + used, buf2, 255);
+ 					used = used + 255;
++					}
+ 				} else if (rc==SQL_SUCCESS) {
+ 					buf = erealloc(buf, used + C->fetched_len+1);
+ 					memcpy(buf + used, buf2, C->fetched_len);
+@@ -697,6 +725,7 @@
+ 			efree(buf2);
+ 			
+ 			/* NULL terminate the buffer once, when finished, for use with the rest of PHP */
++			if (DataType == SQL_C_CHAR)  /* hj add */
+ 			buf[used] = '\0';
+ 
+ 			*ptr = buf;
+@@ -841,6 +870,18 @@
+ 	return 1;
+ }
+ 
++static int odbc_stmt_cursor_closer(pdo_stmt_t *stmt)
++{
++	pdo_odbc_stmt *S = (pdo_odbc_stmt*)stmt->driver_data;
++	if (S->stmt != SQL_NULL_HANDLE) {
++		if (stmt->executed) {
++			SQLCloseCursor(S->stmt);
++		}
++	}
++	free_cols(stmt, S);
++	return 1;
++}
++
+ struct pdo_stmt_methods odbc_stmt_methods = {
+ 	odbc_stmt_dtor,
+ 	odbc_stmt_execute,
+@@ -851,7 +892,8 @@
+ 	odbc_stmt_set_param,
+ 	odbc_stmt_get_attr, /* get attr */
+ 	NULL, /* get column meta */
+-	odbc_stmt_next_rowset
++	odbc_stmt_next_rowset,
++	odbc_stmt_cursor_closer
+ };
+ 
+ /*
