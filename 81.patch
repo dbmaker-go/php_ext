@@ -1,0 +1,113 @@
+diff -urbN pdo_odbc.orig/odbc_driver.c pdo_odbc/odbc_driver.c
+--- pdo_odbc.orig/odbc_driver.c	2022-10-25 17:30:00.000000000 +0000
++++ pdo_odbc/odbc_driver.c	2022-11-29 07:05:36.066955902 +0000
+@@ -342,6 +342,24 @@
+ 			}
+ 			H->assume_utf8 = bval;
+ 			return true;
++		case PDO_ATTR_AUTOCOMMIT:
++			if (!pdo_get_bool_param(&bval, val)) {
++				return false;
++			}
++			/* ignore if the new value equals the old one */
++			if (dbh->auto_commit ^ bval) {
++				RETCODE rc;
++				rc = SQLSetConnectAttr(H->dbc, SQL_ATTR_AUTOCOMMIT,
++						(SQLPOINTER)(dbh->auto_commit ? SQL_AUTOCOMMIT_OFF : SQL_AUTOCOMMIT_ON),
++						SQL_IS_INTEGER);
++				if (rc != SQL_SUCCESS) {
++					pdo_odbc_drv_error("SQLSetConnectAttr AUTOCOMMIT");
++					return 0;
++				}
++				dbh->in_txn = !bval;
++				dbh->auto_commit = bval;
++			}
++			return 1;
+ 		default:
+ 			strcpy(H->einfo.last_err_msg, "Unknown Attribute");
+ 			H->einfo.what = "setAttribute";
+@@ -373,6 +391,9 @@
+ 			ZVAL_STRING(val, "ODBC-" PDO_ODBC_TYPE);
+ 			return 1;
+ 
++		case PDO_ATTR_AUTOCOMMIT:
++			ZVAL_BOOL(val, dbh->auto_commit);
++			return 1;
+ 		case PDO_ATTR_SERVER_VERSION:
+ 			return pdo_odbc_get_info_string(dbh, SQL_DBMS_VER, val);
+ 		case PDO_ATTR_SERVER_INFO:
+diff -urbN pdo_odbc.orig/odbc_stmt.c pdo_odbc/odbc_stmt.c
+--- pdo_odbc.orig/odbc_stmt.c	2022-10-25 17:30:00.000000000 +0000
++++ pdo_odbc/odbc_stmt.c	2022-11-29 07:04:21.752879756 +0000
+@@ -641,17 +641,34 @@
+ {
+ 	pdo_odbc_stmt *S = (pdo_odbc_stmt*)stmt->driver_data;
+ 	pdo_odbc_column *C = &S->cols[colno];
++	SQLSMALLINT DataType;
+ 
+ 	/* if it is a column containing "long" data, perform late binding now */
+ 	if (C->is_long) {
+ 		SQLLEN orig_fetched_len = SQL_NULL_DATA;
+ 		RETCODE rc;
+ 
++		/* hj fix binary */
++		if (C->is_unicode) {
++			DataType = SQL_C_BINARY;
++		} else {
++			switch(C->coltype) {
++				case SQL_BINARY:
++				case SQL_VARBINARY:
++				case SQL_LONGVARBINARY:
++					DataType = SQL_C_BINARY;
++					break;
++				default:
++					DataType = SQL_C_CHAR;
++					break;
++			}
++		}
++
+ 		/* fetch it into C->data, which is allocated with a length
+ 		 * of 256 bytes; if there is more to be had, we then allocate
+ 		 * bigger buffer for the caller to free */
+ 
+-		rc = SQLGetData(S->stmt, colno+1, C->is_unicode ? SQL_C_BINARY : SQL_C_CHAR, C->data,
++		rc = SQLGetData(S->stmt, colno+1, DataType, C->data,  /* hj fix binary */
+  			256, &C->fetched_len);
+ 		orig_fetched_len = C->fetched_len;
+ 
+@@ -675,10 +692,14 @@
+ 			zend_string *str = zend_string_init(C->data, 256, 0);
+ 			size_t used = 255; /* not 256; the driver NUL terminated the buffer */
+ 
++			if (DataType == SQL_C_BINARY) {    /* hj fix binary */
++				used = 256;
++			}
++
+ 			do {
+ 				C->fetched_len = 0;
+ 				/* read block. 256 bytes => 255 bytes are actually read, the last 1 is NULL */
+-				rc = SQLGetData(S->stmt, colno+1, C->is_unicode ? SQL_C_BINARY : SQL_C_CHAR, buf2, 256, &C->fetched_len);
++				rc = SQLGetData(S->stmt, colno+1, DataType, buf2, 256, &C->fetched_len);  /* hj fix binary */
+ 
+ 				/* adjust `used` in case we have length info from the driver */
+ 				if (orig_fetched_len >= 0 && C->fetched_len >= 0) {
+@@ -694,7 +715,11 @@
+ 					 (if a driver fails to follow that and wrote less than 255 bytes to buf2, this will AV or read garbage into buf) */
+ 					str = zend_string_realloc(str, used + 256, 0);
+ 					memcpy(ZSTR_VAL(str) + used, buf2, 256);
++					if (DataType == SQL_C_BINARY) { /* hj fix binary */
++						used = used + 256;
++					} else {
+ 					used = used + 255;
++					}
+ 				} else if (rc==SQL_SUCCESS) {
+ 					str = zend_string_realloc(str, used + C->fetched_len, 0);
+ 					memcpy(ZSTR_VAL(str) + used, buf2, C->fetched_len);
+@@ -709,6 +734,7 @@
+ 			efree(buf2);
+ 
+ 			/* NULL terminate the buffer once, when finished, for use with the rest of PHP */
++			if (DataType == SQL_C_CHAR)  /* hj fix binary */
+ 			ZSTR_VAL(str)[used] = '\0';
+ 			ZVAL_STR(result, str);
+ 			if (C->is_unicode) {
