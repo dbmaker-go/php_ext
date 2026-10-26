@@ -1,14 +1,20 @@
 # PHP dbmaker native driver install
-## download source
-The following steps use Linux and php-8.1.12 as an example
+
+## PHP security update
+
+Use a currently supported, patched PHP release. PHP 8.2.35 fixes CVE-2026-109618 and CVE-2026-109619; earlier PHP 8.2 images must not be used for web workloads. This repository's `82.patch` is validated against PHP 8.2.35.
+
+## Download source
+
+The following steps use Linux and PHP 8.2.35 as an example.
 ```
 -- create temp workspace
 mkdir tmpws
 -- download dbmaker-bundle package and patch to tmpws
 -- download php docker image
-docker pull php:cli
+docker pull php:8.2.35-cli
 -- enter the docker environmen
-docker run -it --rm -v$PWD/tmpws:/tmp php:cli bash
+docker run -it --rm -v "$PWD/tmpws:/tmp" php:8.2.35-cli bash
 -- check php version
 php -v
 -- extract php source
@@ -17,9 +23,9 @@ docker-php-source extract
 
 ## Use pdo_odbc ext
 ```
-cd /usr/src/php/ext/pdo_odbc/
+cd /usr/src/php/ext
 -- patch
-patch < /tmp/81.patch
+patch < /tmp/82.patch
 -- config
 docker-php-ext-configure pdo_odbc \
   --with-pdo-odbc=generic,/opt/bundle,dmapic \
